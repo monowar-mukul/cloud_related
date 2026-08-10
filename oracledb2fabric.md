@@ -1,8 +1,8 @@
-# Moving off Oracle: a solution architect's guide to migrating from a VM to Microsoft Fabric
+# Moving off Oracle: a solution architecture design document for migrating to Microsoft Fabric
 
-Every migration project eventually runs into the same tension: the move itself is temporary, but the mistakes you make while moving can become permanent. That's the single most important idea behind the architecture in this article. There are two flows at play — a **migration/cutover flow** that exists only to get data from Oracle into Fabric safely, and a **steady-state target flow** that is what your analytics platform looks like forever after. Confusing the two, or building your permanent pipelines around temporary migration logic, is the most common way these projects go wrong.
+Every migration project eventually runs into the same tension: the move itself is temporary, but the mistakes you make while moving can become permanent. That's the single most important idea behind the architecture in this document. There are two flows at play — a **migration/cutover flow** that exists only to get data from Oracle into Fabric safely, and a **steady-state target flow** that is what your analytics platform looks like forever after. Confusing the two, or building your permanent pipelines around temporary migration logic, is the most common way these projects go wrong.
 
-This article walks through both flows: the six-step cutover sequence for taking Oracle out of the picture, and the permanent Bronze/Silver/Gold architecture that replaces it. It's written for three audiences at once — the solution architect who needs the full picture, the Oracle DBA or developer who's comfortable with databases but new to Fabric, and the non-technical stakeholder who just wants to know where their reports come from.
+This document walks through both flows — the six-step cutover sequence for taking Oracle out of the picture, and the permanent Bronze/Silver/Gold architecture that replaces it — and then extends into the enterprise governance framework needed once Fabric becomes the platform for more than one application: workspace and domain structure, capacity and region strategy, per-application medallion conventions, and retention/backup policy. It's written for three audiences at once — the solution architect who needs the full picture, the Oracle DBA or developer who's comfortable with databases but new to Fabric, and the non-technical stakeholder who just wants to know where their reports come from.
 
 ---
 
@@ -103,7 +103,57 @@ Running underneath both flows is a set of cross-cutting concerns that apply from
 - **DevOps / release** — Git integration, deployment pipelines, and environment promotion (dev → test → prod) so changes to Bronze/Silver/Gold logic go through the same rigor as any other production system.
 - **Retention / archive** — OneLake retention policy and backup/export rules, decided deliberately rather than left as a default.
 
-None of this is optional scaffolding — it's what turns "we copied Oracle into Fabric" into "we have a governed, auditable analytics platform."
+None of this is optional scaffolding — it's what turns "we copied Oracle into Fabric" into "we have a governed, auditable analytics platform." Oracle was one application. Once Fabric is the platform of record, other applications will land on it too — and each one needs its own workspace, its own retention posture, and its own place in the medallion structure. The rest of this section is the governance framework for that broader estate.
+
+### Domain and workspace structure — decide this before onboarding the next application
+
+The most common failure mode in multi-application Fabric estates: teams create workspaces first and retrofit structure later, and the catalog never reflects reality after thatIn practice, domain design gets skipped more often than any other governance step. Teams create workspaces first, then try to retrofit domains onto an estate that has already grown — and the catalog never reflects reality after that. The fifteen minutes spent on a domain map before provisioning saves weeks of cleanup later.
+
+- **Domains first, workspaces second.** Use Fabric domains to group workspaces by business area (sales, finance, HR, and — for this migration — the Oracle-sourced analytics domain), each with a named owner<cite index="48-1">Sales, finance, operations, customer service, and HR should not all dump assets into one shared workspace. Use domains to reflect those business areas, then assign each domain an owner.</cite> Domains let users filter and govern the OneLake catalog by business area rather than hunting through a flat list of workspaces<cite index="46-1">Use domains to logically group all the data in an organization that's relevant to particular areas or fields, such as by business unit... Grouping data into domains and subdomains enables better discoverability and governance.</cite>
+- **One workspace per application/data product is the default**, with each team owning its full pipeline<cite index="45-1">Option 1: One workspace per data product. In this model, each data product gets one Fabric workspace... Choose this option when one team owns the full pipeline and when moderate isolation meets governance needs.</cite> Only consolidate multiple low-risk apps into a shared workspace when capacity or licensing genuinely forces it, and treat that as a temporary exception, not a pattern<cite index="45-1">Option 3: Consolidate multiple data products into one workspace only when constrained... Limit use to low-criticality workloads and plan a future move to dedicated workspaces.</cite>
+- **Separate dev/test/prod workspaces per application** so developers don't collide with shared environments<cite index="46-1">For development purposes, a best practice is to have isolated workspaces per developer, so each developer can work on their own without interfering with the shared workspace.</cite> — this also gives a clean environment-promotion boundary for CI/CD.
+- **Decide item separation before workspace separation.** Will Bronze/Silver/Gold for each app live in one Lakehouse or three separate items? Will each app's Gold layer live in its own workspace, or will multiple apps share a curated workspace? This cascades directly into the access-control model.
+- **Enforce a naming/creation policy** — who's allowed to create workspaces, naming conventions, mandatory domain assignment — or workspaces accumulate with unclear ownership and no catalog visibility<cite index="44-1">Without a creation policy, workspaces accumulate. Unmanaged workspaces have unclear ownership, inconsistent role assignments, and no catalog visibility. They become governance blind spots with no straightforward path to cleanup.</cite>
+
+### Capacity and region
+
+- Each capacity lives in one Azure region, which determines where compute and OneLake data for its workspaces reside — a data-residency and latency decision, not just a technical one<cite index="43-1">Each Fabric capacity runs in a single Azure region. That region determines where compute and OneLake data for workspaces on that capacity reside. Region decisions affect data residency, latency, and service availability. Best practices: treat region selection as a governance decision.</cite>
+- Decide per-application capacity isolation vs. shared capacity: isolated capacity gives an app predictable performance and clean cost attribution; shared capacity is cheaper but one noisy app can starve others. This is usually the single biggest cost-governance decision in a multi-app estate.
+- Publish an approved region list and enforce it through policy rather than leaving it to individual teams<cite index="43-1">Publish a short list of supported regions and enforce that list through policy.</cite>
+
+### Medallion architecture — per application, with shared conventions
+
+Every application follows the same Bronze/Silver/Gold pattern established for the Oracle migration, but each new app still needs explicit decisions:
+
+- **Shared conventions, independent instances.** Each app gets its own Bronze → Silver → Gold, but naming, schema-tagging, and folder structure should be standardized org-wide so any engineer can navigate any app's Lakehouse the same way.
+- **Cross-domain sharing via OneLake shortcuts**, not copies. If another application needs a table from this Oracle-sourced Gold layer, shortcut into it rather than duplicating data — keeping a single source of truth. Set policy on which layers are shortcut-able across domains (typically Gold only, never Bronze).
+- **Document ownership of each medallion layer per app** — data engineering typically owns Bronze→Silver, data analytics owns Silver→Gold→semantic model — so retention and access decisions below have a clear owner.
+
+### Retention and backup — different per application, and worth designing deliberately
+
+This is the area most teams assume Fabric "just handles," and it only partially does:
+
+- **OneLake soft delete is automatic but shallow** — deleted files are retained for 7 days by default before permanent removal<cite index="52-1">OneLake automatically protects your data with soft delete, which retains deleted files for seven days before permanent removal. This built-in protection helps you recover from accidental deletions or user errors.</cite> That's protection against accidental deletion, not a compliance-grade retention policy.
+- **Geo-redundancy/disaster recovery is a capacity-level setting**, not per-workspace or per-app<cite index="53-1">Geo-redundancy (OneLake disaster recovery) is enabled at the Fabric capacity level, not at workspace or item level.</cite> If different applications need different DR postures, that's a capacity-design decision. It also only replicates OneLake data, asynchronously, and does not back up workspace items, pipelines, or semantic models — recovery is a manual redeploy-and-rehydrate exercise, not an automatic restore<cite index="53-1">Fabric protects data automatically through OneLake geo-replication (capacity-level, Microsoft-managed, no performance impact). This only safeguards the data, it does NOT replicate workspaces, pipelines, or semantic models. So DR in Fabric = Redeploy + Rehydrate, not restore.</cite>
+- **Code/metadata backup is Git, not a storage feature.** Pipelines, notebooks, and semantic model definitions need Git integration as their backup and version history mechanism<cite index="57-1">Microsoft recommends leveraging Delta Lake versioning and OneLake redundancy for data resilience, using Git integration or REST API-based exports for code and metadata, and implementing cross-region replication or Azure Backup for disaster recovery.</cite> — non-negotiable per app, since it's also the DR runbook.
+- **Fabric SQL Database has native point-in-time restore** (7 days by default) if any app uses that item type — the one item type with a built-in backup feature, unlike Lakehouse/Warehouse.
+- **For compliance-driven retention that differs per application** (e.g., a regulated finance app needing 7-year retention vs. an internal dashboard needing 90 days), build custom retention tiers on top of the platform — typically scheduled notebooks that snapshot/archive Delta table versions on a defined cadence<cite index="55-1">Define retention tiers—daily, weekly, monthly, and yearly—to balance compliance requirements and storage efficiency... Utilize Fabric notebooks or scheduled Spark jobs to automate backup.</cite>
+- Attach a retention/backup decision matrix to every application's workspace documentation — *DR required? Retention period? Backup automation owner? Compliance driver?* — rather than leaving it as tribal knowledge.
+
+### Security and data classification
+
+- Model access with **Entra ID security groups mapped to domains and workspace roles**, not individual user assignments<cite index="47-1">The guidance on organizing workspaces by business domain and managing access through Microsoft Entra security groups is also very practical for maintaining governance as projects grow.</cite>
+- Enforce **row-level security and sensitivity labels** at the semantic model layer so classification applies consistently regardless of which report or tool consumes the data.
+- Integrate **Microsoft Purview** across every application's workspace for catalog, lineage, and sensitivity labeling from day one — retrofitting labels onto historical items after governance was skipped is expensive<cite index="44-1">lineage data for earlier work is missing, sensitivity labels were never applied to historical items, and the audit trail has gaps.</cite>
+- Delegate day-to-day management to domain/workspace admins, with tenant-level settings owned centrally<cite index="46-1">Fabric admins should define tenant-wide settings, and domain admins should override delegated settings as needed. Individual teams (workspace owners) define their own more granular workspace-level controls and settings.</cite>
+
+### Operations, cost, and CI/CD across the estate
+
+- **Monitoring and audit** — pipeline run history, capacity utilization, and audit logs per app, surfaced centrally through the Fabric admin portal rather than per-workspace.
+- **Cost attribution** — if apps share capacity, track CU consumption per workspace for chargeback and right-sizing; this is much harder to retrofit than to design in from the start.
+- **CI/CD** — Git-integrated deployment pipelines with dev → test → prod promotion per app, so schema/logic changes go through the same rigor as any production system, and so the DR "redeploy" story above actually works when needed.
+
+**Framework summary:** domain map first, one workspace per application as the default with documented exceptions, capacity/region as a deliberate isolation decision, medallion conventions standardized but instances per-app, and an explicit retention/backup matrix per application — because Fabric's built-in protections are a starting point, not a complete compliance answer across a growing estate of applications.
 
 ---
 
